@@ -350,16 +350,30 @@ var Analyzer = (function () {
       }
       if (!isMax) continue;
       var vals = [];
-      for (j = Math.max(0, f - 30); j <= Math.min(nF - 1, f + 10); j++) vals.push(sm[j]);
+      for (j = Math.max(0, f - 30); j <= Math.max(0, f - 3); j++) vals.push(sm[j]);
       vals.sort(function (a, b) { return a - b; });
       var med = vals[Math.floor(vals.length / 2)];
       if (val < med * 1.6 || val - med < delta * p90) continue;
       var lv = -200;
       for (j = f; j <= Math.min(nF - 1, f + 10); j++) if (lev[j] > lv) lv = lev[j];
       if (lv < floor) continue;
-      onsets.push(refineOnset(x, sr, (f * hop + N / 2) / sr));
+      var tOn = (f * hop + N / 2) / sr, lastO = onsets[onsets.length - 1];
+      // one attack can make two flux peaks; within 60 ms keep the stronger
+      if (lastO && tOn - lastO.raw < 0.06) { if (val > lastO.val) onsets[onsets.length - 1] = { raw: tOn, val: val }; continue; }
+      onsets.push({ raw: tOn, val: val });
     }
-    return { onsets: onsets, floor: floor };
+    var out = [];
+    onsets.forEach(function (o) {
+      var t = refineOnset(x, sr, o.raw), last = out[out.length - 1];
+      // two attacks within 70 ms: keep the one that is still sounding 20-40 ms later (a click dies away, a piano note doesn't)
+      var body = rmsDb(x, Math.round((t + 0.02) * sr), Math.round(0.02 * sr));
+      // a click right before a note can hide the note's own attack: if this onset dies away, look just after it
+      var t2 = refineOnset(x, sr, t + 0.065), body2 = rmsDb(x, Math.round((t2 + 0.02) * sr), Math.round(0.02 * sr));
+      if (t2 > t + 0.025 && body2 > body + 10) { t = t2; body = body2; }
+      if (last && t - last.t < 0.07) { if (body > last.body + 3 || (Math.abs(body - last.body) <= 3 && o.val > last.val)) { last.t = t; last.val = o.val; last.body = body; } return; }
+      out.push({ t: t, val: o.val, body: body });
+    });
+    return { onsets: out.map(function (o) { return o.t; }), floor: floor };
   }
   function refineOnset(x, sr, t) {
     // fine spectral flux (1 ms hop) around the coarse onset
@@ -384,6 +398,25 @@ var Analyzer = (function () {
 
   /* --- pitch class per note --- */
   var MINM = 36, MAXM = 96;
+  function pcProfile(x, sr, s, L) {
+    var nfft = 16384;
+    while (nfft < L) nfft *= 2;
+    var mag = magSpectrum(x, s, L, nfft), binHz = sr / nfft, top = Math.min(sr * 0.45, 7000);
+    var pcScore = new Float64Array(12), pcMidi = new Int32Array(12);
+    for (var m = MINM; m <= MAXM; m++) {
+      var f = midiFreq(m), sc = 0;
+      for (var h = 1; h <= 10; h++) {
+        var fh = f * h;
+        if (fh > top) break;
+        var a = Math.max(1, Math.floor(fh * 0.99 / binHz)), b = Math.min(mag.length - 1, Math.ceil(fh * (1.012 + 0.0025 * h) / binHz)), pk = 0;
+        for (var k = a; k <= b; k++) if (mag[k] > pk) pk = mag[k];
+        sc += pk * Math.pow(h, -0.4);
+      }
+      if (sc > pcScore[m % 12]) { pcScore[m % 12] = sc; pcMidi[m % 12] = m; }
+    }
+    return { score: pcScore, midi: pcMidi };
+  }
+  // Which pitch class just started? The new note is the one whose energy jumped, not just the loudest one ringing.
   function pitchAt(x, sr, t, tNext, prevPc) {
     var s = Math.round((t + 0.022) * sr);
     var endT = tNext != null ? Math.min(t + 0.18, tNext - 0.01) : t + 0.18;
@@ -391,40 +424,26 @@ var Analyzer = (function () {
     if (e - s < 0.03 * sr) e = s + Math.round(0.03 * sr);
     var L = Math.min(e - s, x.length - s);
     if (L < 64) return null;
-    var nfft = 16384;
-    while (nfft < L) nfft *= 2;
-    var mag = magSpectrum(x, s, L, nfft), binHz = sr / nfft, top = Math.min(sr * 0.45, 7000);
-    function peakIn(f0, f1) {
-      var a = Math.max(1, Math.floor(f0 / binHz)), b = Math.min(mag.length - 1, Math.ceil(f1 / binHz)), m = 0;
-      for (var k = a; k <= b; k++) if (mag[k] > m) m = mag[k];
-      return m;
-    }
-    var best = -1, bestM = MINM, pcScore = new Float64Array(12);
-    for (var m = MINM; m <= MAXM; m++) {
-      var f = midiFreq(m), sc = 0;
-      for (var h = 1; h <= 10; h++) {
-        var fh = f * h;
-        if (fh > top) break;
-        sc += peakIn(fh * 0.99, fh * (1.012 + 0.0025 * h)) * Math.pow(h, -0.4);
-      }
-      if (sc > best) { best = sc; bestM = m; }
-      if (sc > pcScore[m % 12]) pcScore[m % 12] = sc;
-    }
-    var pc = bestM % 12, ranked = [];
+    var aft = pcProfile(x, sr, s, L);
+    var Lb = Math.round(0.04 * sr), sb = Math.round((t - 0.012) * sr) - Lb;
+    var bef = sb > 0 ? pcProfile(x, sr, sb, Lb) : null;
+    var ranked = [];
     for (var p = 0; p < 12; p++) ranked.push(p);
-    ranked.sort(function (a, b) { return pcScore[b] - pcScore[a]; });
-    // novelty: previous note may still ring; prefer the new one if it is close
-    if (prevPc != null && ranked[0] === prevPc && pcScore[ranked[1]] > 0.55 * pcScore[ranked[0]]) {
-      pc = ranked[1];
-      var bm = -1;
-      for (m = MINM; m <= MAXM; m++) if (m % 12 === pc) {
-        var ff = midiFreq(m), s2 = 0;
-        for (h = 1; h <= 10 && ff * h <= top; h++) s2 += peakIn(ff * h * 0.99, ff * h * (1.012 + 0.0025 * h)) * Math.pow(h, -0.4);
-        if (s2 > bm) { bm = s2; bestM = m; }
+    ranked.sort(function (a, b) { return aft.score[b] - aft.score[a]; });
+    var topS = aft.score[ranked[0]], pc = ranked[0];
+    var rise = function (q) { return bef ? 20 * Math.log10((aft.score[q] + 1e-9) / (bef.score[q] * 0.85 + 1e-9)) : 20; };
+    // keep the loudest pitch unless it was already ringing and another strong one just began
+    var stale = rise(pc) < 2 || pc === prevPc;
+    if (stale) {
+      for (var i = 1; i < 4; i++) {
+        var q = ranked[i];
+        if (aft.score[q] < 0.4 * topS) break;
+        if (rise(q) >= 6 && rise(q) > rise(pc) + 4) { pc = q; break; }
       }
     }
-    var second = pcScore[ranked[0] === pc ? ranked[1] : ranked[0]];
-    return { pc: pc, midi: bestM, conf: second > 0 ? pcScore[pc] / second : 9 };
+    var second = 0;
+    for (i = 0; i < 12; i++) if (i !== pc && aft.score[i] > second) second = aft.score[i];
+    return { pc: pc, midi: aft.midi[pc], conf: second > 0 ? aft.score[pc] / second : 9, rise: rise(pc) };
   }
 
   function analyze(x, sr, sens) {
@@ -432,8 +451,10 @@ var Analyzer = (function () {
     var on = det.onsets, notes = [];
     var prevPc = null;
     for (var i = 0; i < on.length; i++) {
-      var p = pitchAt(x, sr, on[i], i + 1 < on.length ? on[i + 1] : null, prevPc);
+      var p = pitchAt(x, sr, on[i], i + 1 < on.length ? on[i + 1] : null, notes.length ? notes[notes.length - 1].pc : null);
       if (!p) continue;
+      // a click or thump on top of a ringing note: nothing new started
+      if (p.rise < 3) continue;
       // level: loudest 10 ms after the first 15 ms, so a click on the beat doesn't count as touch
       var lvl = -200, s = Math.round(on[i] * sr), b = Math.round(sr * 0.01), s15 = s + Math.round(sr * 0.015);
       for (var k = 0; k < 6; k++) { var d = rmsDb(x, s15 + k * b, b); if (d > lvl) lvl = d; }
@@ -447,9 +468,9 @@ var Analyzer = (function () {
     var clean = [];
     for (i = 0; i < notes.length; i++) {
       var n = notes[i], pr = clean[clean.length - 1];
-      if (pr && n.pc === pr.pc && n.t - pr.t < 0.09 && n.level < pr.level - 4) continue;
-      // a smeared attack can fire twice; keep the later onset, whose pitch is clean
-      if (pr && n.t - pr.t < 0.06) { clean[clean.length - 1] = n; continue; }
+      // same pitch as the note before is that key still ringing under a click or bump (scales never repeat a note back to back)
+      if (pr && n.pc === pr.pc && n.t - pr.t < 0.6) continue;
+
       clean.push(n);
     }
     return { notes: clean, floor: det.floor };
@@ -486,6 +507,16 @@ var Analyzer = (function () {
     var res = ys.map(function (y, k) { return y - (a + b * xs[k]); });
     return { a: a, b: b, res: res };
   }
+  // Theil-Sen line: one misheard or misplaced note can't drag the whole tempo line
+  function robustFit(xs, ys) {
+    var sl = [], i, j;
+    for (i = 0; i < xs.length; i++) for (j = i + 1; j < xs.length; j++) if (xs[j] !== xs[i]) sl.push((ys[j] - ys[i]) / (xs[j] - xs[i]));
+    sl.sort(function (a, b) { return a - b; });
+    var b = sl[Math.floor(sl.length / 2)];
+    var ic = ys.map(function (y, k) { return y - b * xs[k]; }).sort(function (p, q) { return p - q; });
+    var a = ic[Math.floor(ic.length / 2)];
+    return { a: a, b: b, res: ys.map(function (y, k) { return y - (a + b * xs[k]); }) };
+  }
   function rms(arr) { var s = 0; arr.forEach(function (v) { s += v * v; }); return Math.sqrt(s / Math.max(1, arr.length)); }
   function clamp(v) { return Math.max(0, Math.min(100, v)); }
 
@@ -518,7 +549,7 @@ var Analyzer = (function () {
       res.heardCount = an.notes.length;
       return res;
     }
-    var fit = linfit(played.map(function (p) { return p.k; }), played.map(function (p) { return p.t; }));
+    var fit = robustFit(played.map(function (p) { return p.k; }), played.map(function (p) { return p.t; }));
     var interval = fit.b;
     played.forEach(function (p, i) { p.dev = fit.res[i] / interval; });
     res.interval = interval;
@@ -553,7 +584,71 @@ var Analyzer = (function () {
     return res;
   }
 
-  return { analyze: analyze, evaluate: evaluate, align: align, THRESH: THRESH, midiFreq: midiFreq };
+  /* --- guided recovery: when an expected note is missing, look for its attack where it should be --- */
+  function pcEnergy(x, sr, s, len, pc) {
+    var nfft = 8192; while (nfft < len) nfft *= 2;
+    var mag = magSpectrum(x, s, len, nfft), binHz = sr / nfft, best = 0, all = 0;
+    for (var m = MINM; m <= MAXM; m++) {
+      var f = midiFreq(m), sc = 0;
+      for (var h = 1; h <= 6; h++) {
+        var fh = f * h; if (fh > 6000) break;
+        var a = Math.max(1, Math.floor(fh * 0.985 / binHz)), b = Math.min(mag.length - 1, Math.ceil(fh * 1.02 / binHz)), pk = 0;
+        for (var k = a; k <= b; k++) if (mag[k] > pk) pk = mag[k];
+        sc += pk * Math.pow(h, -0.4);
+      }
+      if (m % 12 === pc && sc > best) best = sc;
+      if (sc > all) all = sc;
+    }
+    return { e: best, dom: all > 0 ? best / all : 0 };
+  }
+  function recover(x, sr, an, expected, cfg) {
+    var ops = align(expected.map(function (e) { return e.pc; }), an.notes.map(function (d) { return d.pc; }));
+    var at = expected.map(function () { return null; });
+    var taken = expected.map(function () { return false; });
+    ops.forEach(function (o) { if (o.type === "match") at[o.e] = an.notes[o.d].t; if (o.type !== "extra") taken[o.e] = o.type !== "miss"; });
+    var known = []; at.forEach(function (t, k) { if (t != null) known.push(k); });
+    if (known.length < 4) return an;
+    var fit = linfit(known, known.map(function (k) { return at[k]; })), iv = fit.b;
+    if (!(iv > 0.04 && iv < 2)) return an;
+    var added = [];
+    for (var k = 0; k < expected.length; k++) {
+      if (at[k] != null || taken[k]) continue;
+      var prev = null, next = null;
+      for (var a = k - 1; a >= 0; a--) if (at[a] != null) { prev = a; break; }
+      for (var b = k + 1; b < expected.length; b++) if (at[b] != null) { next = b; break; }
+      var guess = prev != null ? at[prev] + (k - prev) * iv : at[next] - (next - k) * iv;
+      var lo = Math.max(prev != null ? at[prev] + 0.35 * iv : 0, guess - 0.7 * iv);
+      var hi = Math.min(next != null ? at[next] - 0.35 * iv : x.length / sr - 0.06, guess + (next == null ? 1.5 : 0.7) * iv);
+      if (hi <= lo) continue;
+      var pc = expected[k].pc, W = Math.round(sr * 0.03), step = Math.round(sr * 0.005), bestRise = 0, bestT = null;
+      for (var t = lo; t <= hi; t += step / sr) {
+        var s0 = Math.round(t * sr);
+        var before = pcEnergy(x, sr, s0 - W - Math.round(sr * 0.01), W, pc).e;
+        var after = pcEnergy(x, sr, s0 + Math.round(sr * 0.015), W, pc);
+        var rise = 20 * Math.log10((after.e + 1e-9) / (before + 1e-9));
+        var score = after.dom >= 0.7 ? rise + 3 : after.dom > 0.6 ? rise : -1;
+        if (score > bestRise) { bestRise = score; bestT = t; }
+      }
+      if (bestT != null && bestRise >= 6) {
+        var tt = refineOnset(x, sr, bestT), s1 = Math.round(tt * sr), b10 = Math.round(sr * 0.01), s15 = s1 + Math.round(sr * 0.015), lvl = -200;
+        for (var q = 0; q < 6; q++) { var dd = rmsDb(x, s15 + q * b10, b10); if (dd > lvl) lvl = dd; }
+        added.push({ t: tt, pc: pc, midi: expected[k].midi || 0, conf: 1, level: lvl, recovered: true });
+        at[k] = tt;
+      }
+    }
+    if (!added.length) return an;
+    var notes = an.notes.concat(added).sort(function (p, q) { return p.t - q.t; });
+    return { notes: notes, floor: an.floor, recovered: added.length };
+  }
+  function grade(x, sr, sens, expected, cfg) {
+    var an = recover(x, sr, analyze(x, sr, sens), expected, cfg);
+    var r = evaluate(an, expected, cfg);
+    r.recovered = an.recovered || 0;
+    r.heardCount = an.notes.length;
+    return r;
+  }
+
+  return { analyze: analyze, evaluate: evaluate, grade: grade, align: align, THRESH: THRESH, midiFreq: midiFreq };
 })();
 
 /* Synthesized piano-like scale run, used for the example result. */
@@ -715,6 +810,24 @@ var Synth = (function () {
   var PCN = ["C", "C♯", "D", "E♭", "E", "F", "F♯", "G", "A♭", "A", "B♭", "B"];
   function fmtPct(v) { return (v >= 0 ? "+" : "") + Math.round(v * 100) + "%"; }
 
+  var lastTake = null;
+  function wavBlob(x, sr) {
+    var n = x.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf), i;
+    function str(o, t) { for (var k = 0; k < t.length; k++) v.setUint8(o + k, t.charCodeAt(k)); }
+    str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVE"); str(12, "fmt "); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, n * 2, true);
+    for (i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, x[i])) * 32767, true);
+    return new Blob([buf], { type: "audio/wav" });
+  }
+  function saveTake() {
+    if (!lastTake) return;
+    var a = document.createElement("a"), d = new Date();
+    a.href = URL.createObjectURL(wavBlob(lastTake.x, lastTake.sr));
+    a.download = "scale-take-" + d.getFullYear() + String(d.getMonth() + 1).padStart(2, "0") + String(d.getDate()).padStart(2, "0") + "-" + String(d.getHours()).padStart(2, "0") + String(d.getMinutes()).padStart(2, "0") + ".wav";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+  }
   function renderResult(r, opts) {
     opts = opts || {};
     var seq = r.perNote, th = r.th;
@@ -731,8 +844,10 @@ var Synth = (function () {
     if (!r.incomplete) html += '<div class="eyebrow">Touch, note by note</div>' + strip(r) + '<div class="legend"><span><i class="sw" style="background:var(--ink);opacity:.7"></i>Within ±' + th.spikeDb + ' dB of your average</span><span><i class="sw" style="background:var(--warn)"></i>Sticks out</span><span><i class="sw" style="background:var(--bad)"></i>Wrong note</span><span><i class="sw" style="height:3px;background:var(--brass)"></i>Timing: early (left) or late (right)</span></div>';
     var tips = feedback(r);
     if (tips.length) html += '<ul class="notes-list">' + tips.map(function (t) { return "<li>" + t + "</li>"; }).join("") + "</ul>";
+    if (lastTake && !opts.example) html += '<p class="small">Graded wrong? <button class="btn ghost" id="saveTake" type="button">Save this take</button> and send the file to Claude so the grader can be tuned.</p>';
     if (opts.example) html += '<p class="small">This example was synthesized in the page so you can see the grading. Your own runs replace it.</p>';
     $("result").innerHTML = html;
+    if ($("saveTake")) $("saveTake").addEventListener("click", saveTake);
   }
   function strip(r) {
     // Touch chart: each note's volume compared with the run's average line (dB), allowed band shaded.
@@ -788,8 +903,8 @@ var Synth = (function () {
   /* ---------- grading + ladder ---------- */
   function grade(samples, sr, source) {
     var seq = expected(), L = ladder();
-    var an = Analyzer.analyze(samples, sr, cfg.sens);
-    var r = Analyzer.evaluate(an, seq, { bpm: L.bpm, subdiv: cfg.subdiv, strict: cfg.strict });
+    var r = Analyzer.grade(samples, sr, cfg.sens, seq, { bpm: L.bpm, subdiv: cfg.subdiv, strict: cfg.strict });
+    lastTake = source === "live" ? { x: samples, sr: sr } : null;
     var moved = false;
     if (r.pass) {
       L.streak++;
@@ -840,9 +955,8 @@ var Synth = (function () {
       src.connect(analyser); src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
       proc.onaudioprocess = function (e) {
         if (!capturing) return;
-        var d = e.inputBuffer.getChannelData(0), start = ctx.currentTime - d.length / ctx.sampleRate;
-        var off = Math.max(0, Math.round((captureFrom - start) * ctx.sampleRate));
-        if (off < d.length) chunks.push(d.slice(off));
+        // keep every sample from Listen to Stop; the grader finds the run itself
+        chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
       };
       return true;
     } catch (err) {
@@ -860,6 +974,7 @@ var Synth = (function () {
     if (!(await getMic())) { setStatus("Live listening isn't available here. Grading a recording still works."); return; }
     try { if (navigator.wakeLock) wake = await navigator.wakeLock.request("screen"); } catch (e) {}
     var L = ladder(), seq = expected(), beat = 60 / L.bpm, interval = beat / cfg.subdiv;
+    chunks = []; capturing = true;
     var t0 = ctx.currentTime + 0.25, down = t0 + 4 * beat;
     beatTimes = [];
     for (var b = 0; b < 4; b++) { click(t0 + b * beat, b === 0); beatTimes.push(t0 + b * beat); }
@@ -868,10 +983,10 @@ var Synth = (function () {
       var nb = Math.ceil(runLen / beat) + 1;
       for (b = 0; b < nb; b++) { click(down + b * beat, b % 4 === 0); beatTimes.push(down + b * beat); }
     }
-    chunks = [];
     captureFrom = down - Math.min(0.4 * beat, 0.35);
-    stopAt = down + runLen + Math.max(1.2 * beat, 0.8);
-    capturing = true; state = "countin";
+    // generous tail: mic audio arrives late on phones, and a slow last note still needs to ring
+    stopAt = down + runLen * 1.35 + Math.max(2 * beat, 1.5);
+    state = "countin";
     $("listenLabel").textContent = "Stop";
     setStatus("Count-in: <strong>1 2 3 4</strong>, then play " + seq.length + " notes at " + L.bpm + ".");
     tick();
@@ -979,7 +1094,7 @@ var Synth = (function () {
     try {
       var seq = expected(), L = ladder(), sr = 22050;
       var x = Synth.run(seq.map(function (n) { return n.midi; }), L.bpm, cfg.subdiv, sr, { jitter: 0.03, levelVar: 1.2, bump: { 3: 5 }, late: [[9, 0.18]], seed: 11 });
-      var r = Analyzer.evaluate(Analyzer.analyze(x, sr, "med"), seq, { bpm: L.bpm, subdiv: cfg.subdiv, strict: cfg.strict });
+      var r = Analyzer.grade(x, sr, "med", seq, { bpm: L.bpm, subdiv: cfg.subdiv, strict: cfg.strict });
       if (!$("result").innerHTML) renderResult(r, { example: true });
     } catch (e) {}
   }, 30);
