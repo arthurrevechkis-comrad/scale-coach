@@ -443,10 +443,109 @@ var Analyzer = (function () {
     }
     var second = 0;
     for (i = 0; i < 12; i++) if (i !== pc && aft.score[i] > second) second = aft.score[i];
-    return { pc: pc, midi: aft.midi[pc], conf: second > 0 ? aft.score[pc] / second : 9, rise: rise(pc) };
+    var cands = {};
+    for (i = 0; i < 12; i++) cands[i] = aft.score[i] / (aft.score[pc] || 1);
+    return { pc: pc, midi: aft.midi[pc], conf: second > 0 ? aft.score[pc] / second : 9, rise: rise(pc), cands: cands, midis: aft.midi };
+  }
+
+  function pitchEnergyDb(x, sr, s, L, midi) {
+    var nfft = 4096; while (nfft < L) nfft *= 2;
+    var mag = magSpectrum(x, s, L, nfft), binHz = sr / nfft, f0 = midiFreq(midi), e = 0;
+    for (var h = 1; h <= 6; h++) {
+      var fh = f0 * h; if (fh > 6000) break;
+      var a = Math.max(1, Math.floor(fh * 0.98 / binHz)), b = Math.min(mag.length - 1, Math.ceil(fh * 1.025 / binHz)), pk = 0;
+      for (var k = a; k <= b; k++) if (mag[k] > pk) pk = mag[k];
+      e += pk * pk;
+    }
+    return 10 * Math.log10(e + 1e-12);
+  }
+  // When does this note's own pitch arrive? First moment its harmonics reach within 6 dB of their peak.
+  // Clicks and key thumps are broadband or pitchless, so they don't move this.
+  // A click or key thump can set off the onset detector before the note itself sounds.
+  // Keep the detected time unless this note's pitch is clearly not there yet 25 ms later; then use when it arrives.
+  function pitchOnset(x, sr, t, midi, tNext) {
+    var W = Math.round(sr * 0.012), step = 0.003;
+    var hi = Math.min(t + 0.16, tNext != null ? tNext - 0.02 : t + 0.16);
+    var es = [], ts = [], peak = -1e9;
+    for (var u = t + 0.02; u <= hi; u += step) {
+      var e = pitchEnergyDb(x, sr, Math.round(u * sr), W, midi);
+      es.push(e); ts.push(u); if (e > peak) peak = e;
+    }
+    if (es.length < 10) return t;
+    var early = Math.max(es[0], es[1], es[2]);
+    if (peak - early < 8) return t;
+    for (var i = 0; i + 6 <= es.length; i++) {
+      var ok = true;
+      for (var j = i; j < i + 6; j++) if (es[j] < peak - 6) { ok = false; break; }
+      if (ok) { var tp = ts[i] + W / sr / 2 - 0.006; return tp - t >= 0.05 ? tp : t; }
+    }
+    return t;
+  }
+
+  // If the previous note still dominates right after the detected onset, this note hasn't really sounded yet
+  // (a key thump or click fired early): move to the moment it takes over.
+  function dominanceOnset(x, sr, t, pc, prevPc, tNext) {
+    if (prevPc == null || prevPc === pc) return t;
+    var L = Math.round(sr * 0.03), hi = Math.min(t + 0.12, tNext != null ? tNext - 0.03 : t + 0.12);
+    for (var u = t; u <= hi; u += 0.005) {
+      var pr = pcProfile(x, sr, Math.round((u + 0.005) * sr), L).score;
+      if (pr[pc] >= pr[prevPc]) return u - t < 0.02 ? t : u;
+    }
+    return t;
+  }
+
+  // Energy in a note's own overtones (2nd-6th, skipping the fundamental, which leaks from neighbours at low pitch).
+  function overtoneDb(x, sr, s, L, midi) {
+    var nfft = 2048; while (nfft < L) nfft *= 2;
+    var mag = magSpectrum(x, s, L, nfft), binHz = sr / nfft, f0 = midiFreq(midi), e = 0;
+    for (var h = 2; h <= 6; h++) {
+      var fh = f0 * h; if (fh > 7000) break;
+      var a = Math.max(1, Math.round(fh * 0.99 / binHz) - 1), b = Math.min(mag.length - 1, Math.round(fh * 1.012 / binHz) + 1), pk = 0;
+      for (var k = a; k <= b; k++) if (mag[k] > pk) pk = mag[k];
+      e += pk * pk;
+    }
+    return 10 * Math.log10(e + 1e-12);
+  }
+  // A note starts when its own overtones jump. Clicks, key thumps and the previous note ringing don't move this.
+  function harmonicOnset(x, sr, t, midi, tNext) {
+    var L = Math.round(sr * 0.025), step = 0.0025, lo = t - 0.04, hi = Math.min(t + 0.12, tNext != null ? tNext - 0.01 : t + 0.12);
+    var es = [], us = [];
+    for (var u = lo - 0.025; u <= hi; u += step) { es.push(overtoneDb(x, sr, Math.round(u * sr), L, midi)); us.push(u); }
+    var jumps = [], maxJ = 0, i, j;
+    for (i = 0; i < es.length; i++) {
+      var mn = 1e9;
+      for (j = Math.max(0, i - 8); j < i; j++) if (es[j] < mn) mn = es[j];
+      var jmp = i > 0 ? es[i] - mn : 0;
+      jumps.push(jmp); if (us[i] >= lo && jmp > maxJ) maxJ = jmp;
+    }
+    if (maxJ < 8) return t;
+    for (i = 0; i < es.length; i++) if (us[i] >= lo && jumps[i] >= 0.7 * maxJ) return us[i] + 0.02;
+    return t;
+  }
+
+  // Phones sometimes drop a few milliseconds of audio as exact zeros. Patch each gap with the audio just before it
+  // so the sound resuming doesn't look like a new note.
+  function repairDropouts(x, sr) {
+    var minRun = Math.round(sr * 0.001), y = x, i = 0, n = x.length, copied = false;
+    while (i < n) {
+      if (x[i] === 0) {
+        var j = i; while (j < n && x[j] === 0) j++;
+        var run = j - i;
+        if (run >= minRun && i > run && j < n) {
+          var around = rmsDb(x, i - Math.round(sr * 0.01), Math.round(sr * 0.01));
+          if (around > -60) {
+            if (!copied) { y = new Float32Array(x); copied = true; }
+            for (var k = 0; k < run; k++) y[i + k] = y[i - run + k];
+          }
+        }
+        i = j;
+      } else i++;
+    }
+    return y;
   }
 
   function analyze(x, sr, sens) {
+    x = repairDropouts(x, sr);
     var det = detectOnsets(x, sr, sens || "med");
     var on = det.onsets, notes = [];
     var prevPc = null;
@@ -455,13 +554,18 @@ var Analyzer = (function () {
       if (!p) continue;
       // a click or thump on top of a ringing note: nothing new started
       if (p.rise < 3) continue;
+      // time the note where its own pitch starts sounding (the hammer), not a key thump or click just before it
+      // the attack detector is precise but can be fooled by a click or key thump; the overtone timing isn't fooled
+      // but is a little noisier. Trust the attack unless the two disagree by more than 20 ms.
+      var th = harmonicOnset(x, sr, on[i], p.midi, i + 1 < on.length ? on[i + 1] : null);
+      var tn = Math.abs(th - on[i]) > 0.02 ? th : on[i];
       // level: loudest 10 ms after the first 15 ms, so a click on the beat doesn't count as touch
-      var lvl = -200, s = Math.round(on[i] * sr), b = Math.round(sr * 0.01), s15 = s + Math.round(sr * 0.015);
+      var lvl = -200, s = Math.round(tn * sr), b = Math.round(sr * 0.01), s15 = s + Math.round(sr * 0.015);
       for (var k = 0; k < 6; k++) { var d = rmsDb(x, s15 + k * b, b); if (d > lvl) lvl = d; }
       // skip clicks and taps: a piano note is still sounding 30-70 ms after the attack
       var sus = rmsDb(x, s + Math.round(sr * 0.03), Math.round(sr * 0.04));
       if (sus < det.floor || lvl - sus > 20) continue;
-      notes.push({ t: on[i], pc: p.pc, midi: p.midi, conf: p.conf, level: lvl });
+      notes.push({ t: tn, pc: p.pc, midi: p.midi, conf: p.conf, level: lvl, cands: p.cands, midis: p.midis });
       prevPc = p.pc;
     }
     // drop re-triggers: same pitch, very close, much quieter
@@ -640,8 +744,25 @@ var Analyzer = (function () {
     var notes = an.notes.concat(added).sort(function (p, q) { return p.t - q.t; });
     return { notes: notes, floor: an.floor, recovered: added.length };
   }
+  // Two detections much closer than the tempo allows are one note: keep the earlier time,
+  // and the clearer pitch when the earlier one was a near-tie.
+  function mergeClose(an, cfg) {
+    var iv = 60 / cfg.bpm / cfg.subdiv, out = [];
+    an.notes.forEach(function (n) {
+      var p = out[out.length - 1];
+      if (p && n.t - p.t < 0.45 * iv) {
+        if (n.pc !== p.pc && p.cands && p.cands[n.pc] >= 0.75) { p.pc = n.pc; if (p.midis) p.midi = p.midis[n.pc]; }
+        return;
+      }
+      out.push(n);
+    });
+    // a merge can leave the same pitch twice in a row: that is one note ringing
+    var clean = [];
+    out.forEach(function (n) { var p = clean[clean.length - 1]; if (p && p.pc === n.pc && n.t - p.t < 0.6) return; clean.push(n); });
+    return { notes: clean, floor: an.floor };
+  }
   function grade(x, sr, sens, expected, cfg) {
-    var an = recover(x, sr, analyze(x, sr, sens), expected, cfg);
+    var an = recover(x, sr, mergeClose(analyze(x, sr, sens), cfg), expected, cfg);
     var r = evaluate(an, expected, cfg);
     r.recovered = an.recovered || 0;
     r.heardCount = an.notes.length;
