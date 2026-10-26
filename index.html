@@ -949,6 +949,26 @@ var Synth = (function () {
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
   }
+  // The score can clear its bar while one note still fails the run: say which note, so the red bar makes sense.
+  function worst(r, key) {
+    var w = null;
+    r.perNote.forEach(function (p) { if (p[key] != null && (!w || Math.abs(p[key]) > Math.abs(w[key]))) w = p; });
+    return w;
+  }
+  function timingSub(r, th) {
+    if (r.timingScore >= th.timing && r.timingSpike) {
+      var w = worst(r, "dev");
+      return "but " + w.name + " was " + Math.round(Math.abs(w.dev) * 100) + "% " + (w.dev > 0 ? "late" : "early") + " · limit " + Math.round(th.spikeT * 100) + "%";
+    }
+    return "spread " + r.jitterPct.toFixed(1) + "% · need " + th.timing;
+  }
+  function touchSub(r, th) {
+    if (r.touchScore >= th.touch && r.touchSpike) {
+      var w = worst(r, "levelDev");
+      return "but " + w.name + " was " + (w.levelDev > 0 ? "+" : "−") + Math.abs(w.levelDev).toFixed(1) + " dB · limit ±" + th.spikeDb;
+    }
+    return "± " + r.touchStd.toFixed(1) + " dB · need " + th.touch;
+  }
   function renderResult(r, opts) {
     opts = opts || {};
     var seq = r.perNote, th = r.th;
@@ -958,8 +978,8 @@ var Synth = (function () {
     var gauges = r.incomplete ?
       g("Notes", r.correct + "/" + r.N, "heard " + r.heardCount + " notes", false) + g("Timing", "–", "needs a full run", false) + g("Touch", "–", "needs a full run", false) + g("Tempo", "–", "target " + r.target, false) :
       g("Notes", r.correct + "/" + r.N, Math.round(r.notesScore) + " · need " + th.notes, r.notesOk) +
-      g("Timing", Math.round(r.timingScore), "spread " + r.jitterPct.toFixed(1) + "% · need " + th.timing, r.timingOk) +
-      g("Touch", Math.round(r.touchScore), "± " + r.touchStd.toFixed(1) + " dB · need " + th.touch, r.touchOk) +
+      g("Timing", Math.round(r.timingScore), timingSub(r, th), r.timingOk) +
+      g("Touch", Math.round(r.touchScore), touchSub(r, th), r.touchOk) +
       g("Tempo", r.achievedBpm.toFixed(0), "target " + r.target + " (±" + Math.round(th.tempo * 100) + "%)", r.tempoOk);
     var html = '<div class="verdict"><h2>' + title + "</h2>" + tag + '</div><div class="gauges">' + gauges + "</div>";
     if (!r.incomplete) html += '<div class="eyebrow">Touch, note by note</div>' + strip(r) + '<div class="legend"><span><i class="sw" style="background:var(--ink);opacity:.7"></i>Within ±' + th.spikeDb + ' dB of your average</span><span><i class="sw" style="background:var(--warn)"></i>Sticks out</span><span><i class="sw" style="background:var(--bad)"></i>Wrong note</span><span><i class="sw" style="height:3px;background:var(--brass)"></i>Timing: early (left) or late (right)</span></div>';
